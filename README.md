@@ -124,9 +124,12 @@ files: default
   capture group, only that group is colored; with no group, the whole
   match is colored.
 - `ansi:` blocks define custom color names as raw ANSI escapes:
-  `/mycolor/\033[1;35m/`. These merge into (and can override) the
-  built-in palette: `black red green yellow blue magenta cyan white`
-  and their `bright*` variants, plus `reset`.
+  `/mycolor/\033[1;35m/`. Backslash escapes in the sequence
+  (`\033`, `\x1b`, `\n`, `\t`, `\\`) are decoded, so `\033[1;35m`
+  becomes a real ESC byte rather than being printed as literal text.
+  These merge into (and can override) the built-in palette: `black red
+  green yellow blue magenta cyan white` and their `bright*` variants,
+  plus `reset`.
 - The regex delimiter can be any character that isn't a letter or
   digit (`/`, `|`, `,`, ...) — pick one that isn't itself in your
   pattern, since (as in the original) the delimiter search doesn't
@@ -155,6 +158,9 @@ few latent bugs fixed along the way:
   shared across `ConfigFile` instances.
 - `colorize()` no longer risks an infinite loop on a zero-width regex
   match.
+- `ansi:` sequence values now decode backslash escapes (`\033`,
+  `\x1b`, `\n`, ...); previously `\033[1;35m` was stored and printed
+  as literal text instead of a real ANSI escape.
 
 Everything else — the config DSL's quirks included — is intentionally
 unchanged for drop-in compatibility with an existing `.mtailrc`.

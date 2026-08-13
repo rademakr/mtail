@@ -1,4 +1,12 @@
 # sample .mtailrc
+
+# custom color names -- referenced below by ldap.log's "reverse_rb"
+# and stdin's "brightredblink". backslash escapes (\033, \x1b, \n, ...)
+# in the sequence are decoded into real ANSI escape bytes.
+ansi:
+   /reverse_rb/\033[7;31m/
+   /brightredblink/\033[1;5;31m/
+####
 files: stdin /stdout\.log/
    filters:
       /continuum/c0nTiNuUm/
