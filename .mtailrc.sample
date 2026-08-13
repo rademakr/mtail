@@ -11,32 +11,28 @@ files: stdin /stdout\.log/
    filters:
       /continuum/c0nTiNuUm/
    colors:
-      /^.*$/             blue
-      /^[a-z]+:([^:]+):/ brightblue
-      /(warn:)/          red
-      /(info:)/          green
-      /(debug:)/         brightblack
-      /^error.*/         brightred
-      /FAILED/         brightred
-      /^(error).*/       brightredblink
+      /^.*$/                blue
+      /^[a-z]+:([^:]+):/    brightblue
+      /(warn:)/             red
+      /(info:)/             green
+      /(debug:)/            brightblack
+      /^error.*/            brightred
+      /FAILED/              brightred
+      /^(error).*/          brightredblink
 ####
 files: /mail\.log/
     colors:
-        /stat=Sent/            brightgreen
+      /stat=Sent/           brightgreen
 files: /ldap\.log/
     colors:
-        /slapd starting/      reverse_rb
-      /nentries=0/            brightyellow
-      /err=49/                brightgreen
-      /undefined/             brightred
-      /\(\|\(uid=.*\)\(sourceid=.*\)\(mail=.*\)\)/             brightgreen
+      /slapd starting/                                 reverse_rb
+      /nentries=0/                                     brightyellow
+      /err=49/                                         brightgreen
+      /undefined/                                      brightred
+      /\(\|\(uid=.*\)\(sourceid=.*\)\(mail=.*\)\)/     brightgreen
       /\(\&\(objectClass=.*\)\(uid=.*\)\)/             brightyellow
-      /QUERY NOT CACHEABLE/             brightred
-      /QUERY NOT ANSWERABLE/             brightred
-files: /atos-sva-smtp-entrant\.log/
-        colors:
-      /delay=/         brightcyan
-      /linedata/         brightyellow
+      /QUERY NOT CACHEABLE/                            brightcyan
+      /QUERY NOT ANSWERABLE/                           brightred
 # fallback for `mtail -u UNIT` / `mtail -j` journal sources that don't
 # match a more specific files: block above (unit names are matched
 # against files: regexes the same way file basenames are, so a block
@@ -50,4 +46,4 @@ files: journal
 files: default
    colors:
       /^.*$/             white
-      /FAILED/         brightred
+      /FAILED/           brightred
