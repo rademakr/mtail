@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 if os.environ.get("HOME"):
     DEFAULT_CONFIG_FILE = os.path.join(os.environ["HOME"], ".mtailrc")
@@ -534,6 +534,29 @@ def _read_delimited(s, start):
     return content, end
 
 
+_ANSI_ESCAPE_RE = re.compile(r'\\(x[0-9A-Fa-f]{2}|[0-7]{1,3}|.)')
+_ANSI_SIMPLE_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\'}
+
+
+def _decode_ansi_escapes(s):
+    """
+    Decode C-style backslash escapes (\\033, \\x1b, \\n, ...) in an
+    'ansi:' sequence value, so a raw ANSI escape can be written in the
+    config file the same way DEFAULT_ANSI writes one in Python source.
+    Unrecognized escapes are left untouched. This is intentionally not
+    used for regex patterns/replacements elsewhere, since those give
+    backslash-digit sequences (\\1, \\2, ...) a different meaning.
+    """
+    def repl(m):
+        token = m.group(1)
+        if token.startswith('x'):
+            return chr(int(token[1:], 16))
+        if token[0] in '01234567':
+            return chr(int(token, 8))
+        return _ANSI_SIMPLE_ESCAPES.get(token, '\\' + token)
+    return _ANSI_ESCAPE_RE.sub(repl, s)
+
+
 class ConfigFile:
     """
     Parses an .mtailrc file and hands back the (ansi-map, colors,
@@ -650,7 +673,7 @@ class ConfigFile:
                     seq, end2 = _read_delimited(line, end1)
                 except (ConfigError, ValueError):
                     return self._fail(lineno, "invalid or missing ansi marker")
-                self.ansi[name] = seq
+                self.ansi[name] = _decode_ansi_escapes(seq)
 
             else:
                 return self._fail(lineno, "this line doesn't belong here")

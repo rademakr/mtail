@@ -1,26 +1,15 @@
 # Changelog
 
-## 2.0.0 — Python 3 port
+## 2.2.0 — ansi: escape decoding fix
 
-1. Ported the original Python 2 `mtail` (by Matt Hellige) to Python 3.
-   Same `.mtailrc` DSL, same CLI flags, same coloring algorithm.
-2. Fixed a startup race condition where a fast-finishing file's tailer
-   thread could signal "all done" before a slower file's thread had
-   even started, silently dropping that file's output on multi-file
-   runs.
-3. Fixed `checkconfigs()` mutating the `colors` list while iterating
-   over it (was silently skipping the check on every other
-   unrecognized-color rule after the first removal).
-4. Fixed the ANSI color-name table being a mutable class attribute
-   shared across `ConfigFile` instances.
-5. Fixed a potential infinite loop in `colorize()` on a zero-width
-   regex match.
-6. Replaced `getopt`-based argument parsing with a hand-rolled parser
-   (kept close to the original's exact flag semantics) — no
-   functional CLI changes.
-7. Verified against a real-world `.mtailrc` (multi-block, filters +
-   colors + unrecognized color name) across single-file, multi-file,
-   `-f`/follow, `--remove-blanks`, and stdin routing.
+1. Fixed `ansi:` blocks not decoding backslash escapes (`\033`,
+   `\x1b`, `\n`, ...) in the sequence value. The README's own example
+   (`/mycolor/\033[1;35m/`) never actually worked: `_read_delimited()`
+   only unescapes the delimiter character, so the sequence was stored
+   as the literal 8-character text `\033[1;35m` rather than a real ESC
+   byte, and that literal text got printed instead of a color. Custom
+   `ansi:` names now decode the same way `DEFAULT_ANSI`'s Python
+   string literals already did. See `tests/test_ansi_escapes.py`.
 
 ## 2.1.0 — journalctl support
 
@@ -56,3 +45,25 @@
    counter never decremented for that thread, and mtail would hang
    forever waiting for it even if every other source finished
    normally. Now caught with `except BaseException`.
+
+## 2.0.0 — Python 3 port
+
+1. Ported the original Python 2 `mtail` (by Matt Hellige) to Python 3.
+   Same `.mtailrc` DSL, same CLI flags, same coloring algorithm.
+2. Fixed a startup race condition where a fast-finishing file's tailer
+   thread could signal "all done" before a slower file's thread had
+   even started, silently dropping that file's output on multi-file
+   runs.
+3. Fixed `checkconfigs()` mutating the `colors` list while iterating
+   over it (was silently skipping the check on every other
+   unrecognized-color rule after the first removal).
+4. Fixed the ANSI color-name table being a mutable class attribute
+   shared across `ConfigFile` instances.
+5. Fixed a potential infinite loop in `colorize()` on a zero-width
+   regex match.
+6. Replaced `getopt`-based argument parsing with a hand-rolled parser
+   (kept close to the original's exact flag semantics) — no
+   functional CLI changes.
+7. Verified against a real-world `.mtailrc` (multi-block, filters +
+   colors + unrecognized color name) across single-file, multi-file,
+   `-f`/follow, `--remove-blanks`, and stdin routing.
