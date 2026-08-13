@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""
+mtail - file tailer/colorer.
+
+A Python 3 port of the original mtail by Matt Hellige (matt@immute.net),
+itself derived in part from colortail-0.3.0 by Joakim Andersson.
+
+This port is behaviorally faithful to the original: same .mtailrc
+config-file DSL, same coloring algorithm, same command-line interface.
+It has been modernized (Python 3, argparse-free hand parser kept close
+to the original for exact compatibility, threading.Thread subclassing,
+no more string/getopt modules) and a couple of latent bugs in the
+original have been fixed along the way (see CHANGELOG.md):
+  - checkconfigs() no longer mutates a list while iterating over it
+  - the ANSI escape-sequence dict is no longer a mutable class attribute
+    shared across ConfigFile instances
+  - colorize() no longer risks an infinite loop on a zero-width regex
+    match
+  - fixed a startup race where a fast-finishing file could flip the
+    "all done" signal before a later file's tailer thread had even
+    started, silently dropping that file's output
+
+In addition to plain files and stdin, mtail can also tail systemd
+journal sources via `journalctl` (`-u UNIT` / `-j`), colored using the
+same .mtailrc rules -- see README.md for details.
+
+Please see README.md for usage and .mtailrc format documentation.
+"""
+
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "2.1.0"
+
+if os.environ.get("HOME"):
+    DEFAULT_CONFIG_FILE = os.path.join(os.environ["HOME"], ".mtailrc")
+else:
+    DEFAULT_CONFIG_FILE = None
+
+# default ANSI escape sequences. copied fresh into every ConfigFile
+# instance so that 'ansi:' blocks in one config can't leak into another
+# (this was a latent bug in the original, where this dict lived as a
+# mutable class attribute).
+DEFAULT_ANSI = {
+    "black":         "\033[0;30m",
+    "red":           "\033[0;31m",
+    "green":         "\033[0;32m",
+    "yellow":        "\033[0;33m",
+    "blue":          "\033[0;34m",
+    "magenta":       "\033[0;35m",
+    "cyan":          "\033[0;36m",
+    "white":         "\033[0;37m",
+    "brightblack":   "\033[1;30m",
+    "brightred":     "\033[1;31m",
+    "brightgreen":   "\033[1;32m",
+    "brightyellow":  "\033[1;33m",
+    "brightblue":    "\033[1;34m",
+    "brightmagenta": "\033[1;35m",
+    "brightcyan":    "\033[1;36m",
+    "brightwhite":   "\033[1;37m",
+    "reset":         "\033[0m",
+}
+
+# --------------------------------------------------------------------------
+# global state (mirrors the original module-level globals)
+# --------------------------------------------------------------------------
+lock = threading.Lock()
+event = threading.Event()
+last_filename = None
+multiple = False
+verbose = False
+silent = False
+active = 0
+remove_blanks = False
+
+# subprocesses spawned for journalctl sources, so we can clean them up
+# on exit rather than leaving them running after mtail quits.
+_child_procs = []
+
+
+def main():
+    global multiple, active
+
+    print()
+    signal.signal(signal.SIGINT, handle_interrupt)
+
+    initial_lines, filenames, follow, units, journal, journal_args = process_args()
+    config = ConfigFile(DEFAULT_CONFIG_FILE if config_file_override is None
+                         else config_file_override)
+    config.loadconfig()
+
+    # a "source" is a (kind, value) pair: ('file', path-or-None),
+    # ('unit', unit-name), or ('journal', None) for the whole journal.
+    sources = [('file', filename) for filename in filenames]
+    sources += [('unit', unit) for unit in units]
+    if journal:
+        sources.append(('journal', None))
+
+    if len(sources) > 1:
+        multiple = True
+
+    # set the full active count *before* starting any thread. starting
+    # threads one-at-a-time while incrementing `active` alongside them
+    # (as the original did) is racy: a fast-finishing first thread can
+    # decrement `active` back to 0 -- and so fire the "all done" event
+    # -- before a slower-to-start second thread has even begun, causing
+    # mtail to exit early and silently drop that source's output.
+    active = len(sources)
+    threads = [TailerThread(initial_lines, kind, value, follow, config, journal_args)
+               for kind, value in sources]
+    for t in threads:
+        t.start()
+
+    while True:
+        # a timeout is required here, or signals get swallowed while
+        # we're blocked in Event.wait() (this was true of Python 2's
+        # threading module and remains good practice).
+        event.wait(10000)
+        if event.is_set():
+            _kill_children()
+            sys.exit(0)
+
+
+def _kill_children():
+    for proc in _child_procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def handle_interrupt(signum, frame):
+    _kill_children()
+    sys.exit(0)
+
+
+class TailerThread(threading.Thread):
+    """
+    Tails one source -- a file, stdin, a single systemd unit's journal,
+    or the whole journal -- colorizing and printing each line.
+    """
+
+    def __init__(self, initial_lines, kind, value, follow, config, journal_args):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.initial_lines = initial_lines
+        self.kind = kind
+        self.value = value
+        self.follow = follow
+        self.config = config
+        self.journal_args = journal_args
+        self.filename = None  # set once we know the display name
+
+    def run(self):
+        global active
+        try:
+            self.do_run()
+        except BaseException:
+            # a source that fails to open (missing file, bad journalctl
+            # invocation, etc.) calls sys.exit(1), which raises
+            # SystemExit -- not a subclass of Exception. Catching only
+            # Exception here (as the original did) meant that error
+            # path skipped the active-count decrement below entirely,
+            # hanging mtail forever if any *other* source was still
+            # running. Catch everything and always fall through.
+            pass
+        with lock:
+            active -= 1
+            if active == 0:
+                event.set()
+
+    def do_run(self):
+        global last_filename
+
+        if self.kind == 'file' and self.value is not None:
+            basename = os.path.basename(self.value)
+            ansi, colors, do_filter = self.config.getconfig(basename)
+            tailer = TailFile(self.value, self.follow)
+            tailer.seek_lines(self.initial_lines)
+            self.filename = self.value
+
+        elif self.kind == 'file':  # value is None -> stdin
+            if not multiple and not silent:
+                print('*** reading stdin, will just follow...')
+                print()
+            self.filename = 'standard input'
+            ansi, colors, do_filter = self.config.getstdinconfig()
+            tailer = _StdinTailer()
+
+        elif self.kind == 'unit':
+            ansi, colors, do_filter = self.config.getjournalunitconfig(self.value)
+            tailer = JournalSource(self.value, self.initial_lines, self.follow,
+                                    self.journal_args)
+            self.filename = 'journalctl -u %s' % self.value
+
+        else:  # kind == 'journal' -- the whole journal, no unit filter
+            ansi, colors, do_filter = self.config.getjournalconfig()
+            tailer = JournalSource(None, self.initial_lines, self.follow,
+                                    self.journal_args)
+            self.filename = 'journalctl'
+
+        while True:
+            line = tailer.readline()
+            if not line:
+                break
+            if line.endswith('\n'):
+                line = line[:-1]
+            line = do_filter(line)
+            if remove_blanks and not line:
+                continue
+            with lock:
+                try:
+                    if (multiple or verbose) and not silent \
+                            and last_filename != self.filename:
+                        last_filename = self.filename
+                        print()
+                        print(colorize(ansi, colors, '==> %s <==' % self.filename))
+                    print(colorize(ansi, colors, line))
+                except Exception:
+                    print(ansi['reset'])
+                    sys.exit(1)
+                sys.stdout.flush()
+
+
+class _StdinTailer:
+    """Thin wrapper so stdin looks like a TailFile for the read loop."""
+
+    def readline(self):
+        return sys.stdin.readline()
+
+
+# --------------------------------------------------------------------------
+# argument parsing (hand-rolled, mirrors the original getopt-based parser
+# and its exact semantics/help text rather than adopting argparse's)
+# --------------------------------------------------------------------------
+
+config_file_override = None
+
+
+def process_args():
+    global verbose, silent, remove_blanks, config_file_override
+
+    args = sys.argv[1:]
+    lines = None
+    follow = False
+    filenames = []
+    units = []
+    journal = False
+    journal_args = []
+
+    def take_value(i, flag):
+        """Handles both `--flag=value` (arg already contains '=') and
+        `--flag value` (value is the next arg) forms."""
+        arg = args[i]
+        if '=' in arg:
+            return arg.split('=', 1)[1], i
+        i += 1
+        if i >= len(args):
+            sys.stderr.write("option %s requires an argument!\n\n" % flag)
+            usage()
+            sys.exit(1)
+        return args[i], i
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ('-f', '--follow'):
+            follow = True
+        elif arg in ('-n', '--lines') or arg.startswith('--lines='):
+            lines, i = take_value(i, '-n/--lines')
+        elif arg in ('-?', '-h', '--help'):
+            usage()
+            sys.exit(1)
+        elif arg in ('-v', '--verbose'):
+            verbose = True
+        elif arg in ('-q', '--quiet', '--silent'):
+            silent = True
+        elif arg == '--config' or arg.startswith('--config='):
+            config_file_override, i = take_value(i, '--config')
+        elif arg == '--remove-blanks':
+            remove_blanks = True
+        elif arg in ('-u', '--unit') or arg.startswith('--unit='):
+            unit, i = take_value(i, '-u/--unit')
+            units.append(unit)
+        elif arg in ('-j', '--journal'):
+            journal = True
+        elif arg == '--journal-arg' or arg.startswith('--journal-arg='):
+            jarg, i = take_value(i, '--journal-arg')
+            journal_args.append(jarg)
+        elif arg.startswith('-') and arg not in ('-',):
+            sys.stderr.write('unrecognized option!\n\n')
+            usage()
+            sys.exit(1)
+        else:
+            filenames.append(arg)
+        i += 1
+
+    if lines is None:
+        lines = 10
+    else:
+        try:
+            lines = int(lines)
+        except ValueError:
+            sys.stderr.write("'-n/--lines' requires a numeric argument!\n\n")
+            usage()
+            sys.exit(1)
+
+    parsed_filenames = []
+    for filename in filenames:
+        if filename == '-':
+            parsed_filenames.append(None)
+        else:
+            parsed_filenames.append(filename)
+    if len(parsed_filenames) == 0 and not units and not journal:
+        parsed_filenames.append(None)
+
+    return lines, parsed_filenames, follow, units, journal, journal_args
+
+
+def usage():
+    print('mtail %s (python3 port, original by matt hellige <matt@immute.net>)' % VERSION)
+    print()
+    print('usage: %s [option]... [<filename>]...' % sys.argv[0])
+    print('  -?, -h, --help             print this usage info and exit')
+    print('      -f, --follow           output appended data as the file grows')
+    print('      -n, --lines=N          output the last N lines, instead of the last 10')
+    print('      -v, --verbose          always output headers giving file names')
+    print('      -q, --quiet, --silent  never output headers giving file names')
+    print('      --config=FILE          use config file FILE instead of ~/.mtailrc')
+    print('      --remove-blanks        do not display blank lines')
+    print('  -u, --unit=UNIT            tail this systemd unit\'s journal (repeatable)')
+    print('  -j, --journal              tail the whole journal (journalctl, no -u filter)')
+    print('      --journal-arg=ARG      pass ARG through to journalctl (repeatable)')
+    print()
+    print('with more than one filename/unit/journal source, mtail will precede')
+    print('each chunk of output with a header giving the source name. if no')
+    print('filenames, units, or -j are given, standard input is used.')
+    print()
+    print('journal sources are colored using the same .mtailrc rules as files:')
+    print('a files: block\'s regex is matched against the unit name, and a')
+    print('files: journal block (like files: stdin) sets the fallback used for')
+    print('any unit without a more specific match. -f and -n are passed through')
+    print('to journalctl for journal sources.')
+    print()
+
+
+# --------------------------------------------------------------------------
+# colorizing
+# --------------------------------------------------------------------------
+
+def colorize(ansi, colors, line):
+    """Returns `line` wrapped in ANSI escape sequences per `colors`."""
+    if line == "":
+        return line
+
+    colarray = [None] * len(line)
+    # match each regexp in turn, painting into the color array. later
+    # entries in `colors` paint over earlier ones where they overlap.
+    for pattern, colorname in colors:
+        pos = 0
+        m = pattern.search(line, pos)
+        while m is not None:
+            if m.groups() and m.group(1) is not None:
+                start, end = m.start(1), m.end(1)
+            else:
+                start, end = m.start(), m.end()
+            if end > start:
+                colarray[start:end] = [colorname] * (end - start)
+            pos = m.end()
+            if pos == m.start():
+                pos += 1  # guard against zero-width matches looping forever
+            m = pattern.search(line, pos)
+
+    parts = []
+    curcolor = None
+    for i, ch in enumerate(line):
+        if colarray[i] != curcolor:
+            if curcolor is not None:
+                parts.append(ansi['reset'])
+            curcolor = colarray[i]
+            if curcolor is not None:
+                parts.append(ansi[curcolor])
+        parts.append(ch)
+    if curcolor is not None:
+        parts.append(ansi['reset'])
+    return ''.join(parts)
+
+
+# --------------------------------------------------------------------------
+# file tailing
+# --------------------------------------------------------------------------
+
+class TailFile:
+    """
+    Reads a file line-by-line, optionally blocking/polling to follow
+    appended data, and can seek to N lines from the end before reading.
+    """
+
+    def __init__(self, filename, follow=False):
+        self.filename = filename
+        self.follow = follow
+        self.readbuf = ""
+
+        if not os.path.exists(filename):
+            sys.stderr.write("no such file: '%s'.\n" % filename)
+            sys.exit(1)
+        if os.path.isdir(filename):
+            sys.stderr.write("file '%s' is a directory.\n" % filename)
+            sys.exit(1)
+        if not os.access(filename, os.R_OK):
+            sys.stderr.write("cannot read file '%s'. permission denied.\n" % filename)
+            sys.exit(1)
+
+        self.file = open(filename, 'r', errors='replace')
+
+    def readline(self):
+        index = self.readbuf.find('\n')
+        while index == -1:
+            try:
+                n = self.more_to_read()
+            except Exception:
+                return None
+            if n == 0:
+                if self.follow:
+                    time.sleep(1)
+                else:
+                    return None
+            else:
+                self.readbuf += self.file.read(n)
+                index = self.readbuf.find('\n')
+        line = self.readbuf[:index + 1]
+        self.readbuf = self.readbuf[index + 1:]
+        return line
+
+    def seek_lines(self, lines):
+        bufsize = 2048
+        bytestoread = 2048
+        self.file.seek(0, 2)
+        if lines == 0:
+            return
+        pos = self.file.tell()
+        while pos != 0:
+            pos = pos - bufsize
+            if pos < 0:
+                bytestoread = bytestoread + pos
+                pos = 0
+            self.file.seek(pos)
+            buf = self.file.read(bytestoread)
+            j = len(buf) - 1
+            while j >= 0:
+                if buf[j] == '\n':
+                    lines = lines - 1
+                    if lines < 0:
+                        self.file.seek(pos + j + 1)
+                        return
+                j = j - 1
+        self.file.seek(0)
+
+    def end_of_file_position(self):
+        return os.stat(self.filename)[stat.ST_SIZE]
+
+    def more_to_read(self):
+        end = self.end_of_file_position()
+        if end < self.file.tell():
+            self.file.seek(end)
+            return 0
+        return end - self.file.tell()
+
+
+class JournalSource:
+    """
+    Wraps a `journalctl` subprocess so it can be read line-by-line the
+    same way a TailFile is. `unit` is a systemd unit name (e.g. 'sshd'
+    or 'sshd.service') or None to tail the whole journal. `extra_args`
+    is a list of additional raw journalctl arguments (e.g. from
+    --journal-arg on the mtail command line).
+    """
+
+    def __init__(self, unit, initial_lines, follow, extra_args):
+        self.unit = unit
+        args = ['journalctl', '--no-pager', '-n', str(initial_lines)]
+        if follow:
+            args.append('-f')
+        if unit is not None:
+            args += ['-u', unit]
+        args += extra_args
+
+        try:
+            self.proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=None,
+                text=True, bufsize=1)
+        except FileNotFoundError:
+            sys.stderr.write("'journalctl' was not found on this system.\n")
+            sys.exit(1)
+
+        with lock:
+            _child_procs.append(self.proc)
+
+    def readline(self):
+        return self.proc.stdout.readline()
+
+
+# --------------------------------------------------------------------------
+# config file parsing
+# --------------------------------------------------------------------------
+
+class ConfigError(Exception):
+    pass
+
+
+def _read_delimited(s, start):
+    """
+    s[start] must be a delimiter character (any character that isn't a
+    letter or digit -- '/', '|', ',', etc. all work). Returns
+    (content, end_index) where end_index is the index of the matching
+    closing delimiter (the *first* occurrence of the delimiter char
+    after `start`, exactly as the original implementation worked --
+    note this means a delimiter can't be embedded verbatim even when
+    backslash-escaped, since the search for the terminator doesn't
+    consider escaping; the escaping only affects what ends up in the
+    returned content).
+    """
+    sep = s[start]
+    if sep.isalnum():
+        raise ConfigError("invalid regexp marker %r" % sep)
+    end = s.index(sep, start + 1)
+    content = s[start + 1:end].replace('\\' + sep, sep)
+    return content, end
+
+
+class ConfigFile:
+    """
+    Parses an .mtailrc file and hands back the (ansi-map, colors,
+    filter-function) tuple to use for a given filename or for stdin.
+    """
+
+    def __init__(self, filename):
+        self.filename = filename
+        self.configs = []
+        self.stdinconfig = None
+        self.journalconfig = None
+        self.default = {'colors': [], 'filters': []}
+        self.ansi = dict(DEFAULT_ANSI)
+
+    def loadconfig(self):
+        if self.filename is None or not (
+                os.path.exists(self.filename)
+                and os.path.isfile(self.filename)
+                and os.access(self.filename, os.R_OK)):
+            self.stdinconfig = self.default
+            self.journalconfig = self.default
+            return
+
+        config = None
+        mode = None
+        stdin_flag = False
+        journal_flag = False
+        default_flag = False
+        nonstdin_flag = False
+
+        def flush():
+            if config is not None:
+                if nonstdin_flag:
+                    self.configs.append(config)
+                if stdin_flag and self.stdinconfig is None:
+                    self.stdinconfig = config
+                if journal_flag and self.journalconfig is None:
+                    self.journalconfig = config
+                if default_flag:
+                    self.default = config
+
+        with open(self.filename, 'r', errors='replace') as f:
+            raw_lines = f.readlines()
+
+        for lineno, raw in enumerate(raw_lines, 1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            if line.startswith('files:'):
+                flush()
+                stdin_flag = journal_flag = default_flag = nonstdin_flag = False
+                filesre = None
+                rest = line[6:].strip()
+                while rest:
+                    if rest.startswith('stdin'):
+                        stdin_flag = True
+                        rest = rest[5:].lstrip()
+                    elif rest.startswith('journal'):
+                        journal_flag = True
+                        rest = rest[7:].lstrip()
+                    elif rest.startswith('default'):
+                        default_flag = True
+                        rest = rest[7:].lstrip()
+                    else:
+                        try:
+                            rexp, end = _read_delimited(rest, 0)
+                        except (ConfigError, ValueError):
+                            return self._fail(lineno, "invalid or missing regexp end marker")
+                        filesre = '(%s)' % rexp if filesre is None else '%s|(%s)' % (filesre, rexp)
+                        rest = rest[end + 1:].lstrip()
+                config = {'colors': [], 'filters': []}
+                if filesre is not None:
+                    nonstdin_flag = True
+                    config['files'] = re.compile(filesre)
+                mode = None
+
+            elif line.startswith('ansi:'):
+                flush()
+                mode = 'ansi'
+                config = None
+
+            elif line.startswith('colors:'):
+                if config is None:
+                    return self._fail(lineno, "'colors:' found outside of 'files:' block")
+                mode = 'colors'
+
+            elif line.startswith('filters:'):
+                if config is None:
+                    return self._fail(lineno, "'filters:' found outside of 'files:' block")
+                mode = 'filters'
+
+            elif mode == 'colors':
+                try:
+                    rexp, end = _read_delimited(line, 0)
+                except (ConfigError, ValueError):
+                    return self._fail(lineno, "invalid or missing regexp end marker")
+                color = line[end + 1:].strip()
+                if not color:
+                    return self._fail(lineno, "missing color")
+                config['colors'].append((re.compile(rexp), color))
+
+            elif mode == 'filters':
+                try:
+                    sub, end1 = _read_delimited(line, 0)
+                    repl, end2 = _read_delimited(line, end1)
+                except (ConfigError, ValueError):
+                    return self._fail(lineno, "invalid or missing filter marker")
+                config['filters'].append((re.compile(sub), repl))
+
+            elif mode == 'ansi':
+                try:
+                    name, end1 = _read_delimited(line, 0)
+                    seq, end2 = _read_delimited(line, end1)
+                except (ConfigError, ValueError):
+                    return self._fail(lineno, "invalid or missing ansi marker")
+                self.ansi[name] = seq
+
+            else:
+                return self._fail(lineno, "this line doesn't belong here")
+
+        flush()
+        if self.stdinconfig is None:
+            self.stdinconfig = self.default
+        if self.journalconfig is None:
+            self.journalconfig = self.default
+        self.checkconfigs()
+
+    def _fail(self, lineno, msg):
+        sys.stderr.write("configuration error! %s at line %d.\n" % (msg, lineno))
+        sys.stderr.write("using no config!\n")
+        self.configs = []
+        self.stdinconfig = self.default
+        self.journalconfig = self.default
+
+    def checkconfigs(self):
+        """Drop any color rules that reference an unknown color name."""
+        for config in self.configs + [self.stdinconfig, self.journalconfig, self.default]:
+            config['colors'] = [c for c in config['colors'] if c[1] in self.ansi]
+
+    @staticmethod
+    def _filter_fn(filters):
+        def do_filter(text, filters=filters):
+            for pattern, repl in filters:
+                text = pattern.sub(repl, text)
+            return text
+        return do_filter
+
+    def getstdinconfig(self):
+        return (self.ansi, self.stdinconfig['colors'],
+                self._filter_fn(self.stdinconfig['filters']))
+
+    def getjournalconfig(self):
+        """Config to use for the whole journal (`-j`, no unit filter)."""
+        return (self.ansi, self.journalconfig['colors'],
+                self._filter_fn(self.journalconfig['filters']))
+
+    def getconfig(self, filename, fallback=None):
+        """
+        `filename` should be a basename (or, for journal units, a unit
+        name), not a full path. `fallback` is the config to use when
+        no `files:` regex matches -- normally self.default, but
+        getjournalunitconfig() below uses self.journalconfig instead
+        so units fall back to a `files: journal` block if one exists.
+        """
+        fallback = fallback if fallback is not None else self.default
+        colors = fallback['colors']
+        filters = fallback['filters']
+        for config in self.configs:
+            if config['files'].match(filename):
+                colors = config['colors']
+                filters = config['filters']
+                break
+        return self.ansi, colors, self._filter_fn(filters)
+
+    def getjournalunitconfig(self, unit_name):
+        """
+        Config to use for a single systemd unit's journal (`-u UNIT`).
+        Matched against `files:` regexes first (so e.g. `files:
+        /sshd/` colors both a sshd.log file and a `-u sshd` journal
+        the same way), falling back to a `files: journal` block, and
+        finally to `files: default`.
+        """
+        return self.getconfig(unit_name, fallback=self.journalconfig)
+
+
+if __name__ == '__main__':
+    main()
