@@ -32,6 +32,12 @@ mtail [option]... [<filename>]...
 
   -?, -h, --help             print usage info and exit
       -f, --follow           output appended data as the file grows
+  -F, --follow-name          like -f, but also follow the file *by name*:
+                             if it's rotated/replaced (renamed away and a
+                             new file created at the same path), reopen
+                             the new file from the start. Also retries
+                             while the path is temporarily missing,
+                             instead of exiting.
       -n, --lines=N          output the last N lines, instead of the last 10
       -v, --verbose          always output headers giving file names
       -q, --quiet, --silent  never output headers giving file names

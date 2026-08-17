@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.3.0 — -F / --follow-name
+
+1. Added `-F`, `--follow-name` for file sources: like `-f`, but also
+   follows the file *by name*. If the file is rotated (renamed away
+   and a new file created at the same path, as with typical
+   `logrotate` configs that don't use `copytruncate`), mtail detects
+   the inode change and reopens the new file from the start. It also
+   retries while the path is temporarily missing (between the rename
+   and the new file's creation) instead of ending the tail. Plain
+   `-f` is unchanged: it still follows the open file descriptor only,
+   so it keeps working with `copytruncate`-style rotation (same
+   inode, truncated in place) but not rename-based rotation.
+2. While implementing the above, found and fixed a livelock: the
+   initial version only checked for rotation when `more_to_read()`
+   observed 0 new bytes, but after a rotation, `more_to_read()` could
+   spuriously compute a positive byte count by comparing the *new*
+   file's size at the path against `tell()` on the *old*, already-
+   exhausted file descriptor -- so the rotation check never ran, and
+   `readline()` looped forever re-reading 0 bytes from the stale
+   descriptor. Fixed by checking for rotation at the top of every
+   `more_to_read()` poll, before any size/position comparison, so the
+   open file descriptor can never be stale when those comparisons
+   happen.
+
 ## 2.2.0 — ansi: escape decoding fix
 
 1. Fixed `ansi:` blocks not decoding backslash escapes (`\033`,

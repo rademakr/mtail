@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 if os.environ.get("HOME"):
     DEFAULT_CONFIG_FILE = os.path.join(os.environ["HOME"], ".mtailrc")
@@ -90,7 +90,7 @@ def main():
     print()
     signal.signal(signal.SIGINT, handle_interrupt)
 
-    initial_lines, filenames, follow, units, journal, journal_args = process_args()
+    initial_lines, filenames, follow, follow_name, units, journal, journal_args = process_args()
     config = ConfigFile(DEFAULT_CONFIG_FILE if config_file_override is None
                          else config_file_override)
     config.loadconfig()
@@ -112,7 +112,7 @@ def main():
     # -- before a slower-to-start second thread has even begun, causing
     # mtail to exit early and silently drop that source's output.
     active = len(sources)
-    threads = [TailerThread(initial_lines, kind, value, follow, config, journal_args)
+    threads = [TailerThread(initial_lines, kind, value, follow, follow_name, config, journal_args)
                for kind, value in sources]
     for t in threads:
         t.start()
@@ -146,13 +146,14 @@ class TailerThread(threading.Thread):
     or the whole journal -- colorizing and printing each line.
     """
 
-    def __init__(self, initial_lines, kind, value, follow, config, journal_args):
+    def __init__(self, initial_lines, kind, value, follow, follow_name, config, journal_args):
         threading.Thread.__init__(self)
         self.daemon = True
         self.initial_lines = initial_lines
         self.kind = kind
         self.value = value
         self.follow = follow
+        self.follow_name = follow_name
         self.config = config
         self.journal_args = journal_args
         self.filename = None  # set once we know the display name
@@ -181,7 +182,7 @@ class TailerThread(threading.Thread):
         if self.kind == 'file' and self.value is not None:
             basename = os.path.basename(self.value)
             ansi, colors, do_filter = self.config.getconfig(basename)
-            tailer = TailFile(self.value, self.follow)
+            tailer = TailFile(self.value, self.follow, self.follow_name)
             tailer.seek_lines(self.initial_lines)
             self.filename = self.value
 
@@ -249,6 +250,7 @@ def process_args():
     args = sys.argv[1:]
     lines = None
     follow = False
+    follow_name = False
     filenames = []
     units = []
     journal = False
@@ -272,6 +274,9 @@ def process_args():
         arg = args[i]
         if arg in ('-f', '--follow'):
             follow = True
+        elif arg in ('-F', '--follow-name'):
+            follow = True
+            follow_name = True
         elif arg in ('-n', '--lines') or arg.startswith('--lines='):
             lines, i = take_value(i, '-n/--lines')
         elif arg in ('-?', '-h', '--help'):
@@ -320,7 +325,7 @@ def process_args():
     if len(parsed_filenames) == 0 and not units and not journal:
         parsed_filenames.append(None)
 
-    return lines, parsed_filenames, follow, units, journal, journal_args
+    return lines, parsed_filenames, follow, follow_name, units, journal, journal_args
 
 
 def usage():
@@ -329,6 +334,10 @@ def usage():
     print('usage: %s [option]... [<filename>]...' % sys.argv[0])
     print('  -?, -h, --help             print this usage info and exit')
     print('      -f, --follow           output appended data as the file grows')
+    print('  -F, --follow-name          same as -f, but also follow the file by')
+    print('                             name: if it is rotated/replaced, reopen')
+    print('                             the new file at the same path, retrying')
+    print('                             while the path is (temporarily) missing')
     print('      -n, --lines=N          output the last N lines, instead of the last 10')
     print('      -v, --verbose          always output headers giving file names')
     print('      -q, --quiet, --silent  never output headers giving file names')
@@ -402,9 +411,10 @@ class TailFile:
     appended data, and can seek to N lines from the end before reading.
     """
 
-    def __init__(self, filename, follow=False):
+    def __init__(self, filename, follow=False, follow_name=False):
         self.filename = filename
         self.follow = follow
+        self.follow_name = follow_name
         self.readbuf = ""
 
         if not os.path.exists(filename):
@@ -418,6 +428,7 @@ class TailFile:
             sys.exit(1)
 
         self.file = open(filename, 'r', errors='replace')
+        self.inode = os.stat(filename)[stat.ST_INO]
 
     def readline(self):
         index = self.readbuf.find('\n')
@@ -429,14 +440,36 @@ class TailFile:
             if n == 0:
                 if self.follow:
                     time.sleep(1)
-                else:
-                    return None
-            else:
-                self.readbuf += self.file.read(n)
-                index = self.readbuf.find('\n')
+                    continue
+                return None
+            self.readbuf += self.file.read(n)
+            index = self.readbuf.find('\n')
         line = self.readbuf[:index + 1]
         self.readbuf = self.readbuf[index + 1:]
         return line
+
+    def _reopen_if_rotated(self):
+        """
+        -F support: detect a file replaced at the same path (rename-based
+        log rotation) by comparing inodes, and reopen from the start. A
+        missing path (rotated away but not yet recreated) or a permission
+        error just means "keep waiting", handled by the caller's retry loop.
+        """
+        try:
+            st = os.stat(self.filename)
+        except OSError:
+            return False
+        if st[stat.ST_INO] == self.inode:
+            return False
+        try:
+            newfile = open(self.filename, 'r', errors='replace')
+        except OSError:
+            return False
+        self.file.close()
+        self.file = newfile
+        self.inode = st[stat.ST_INO]
+        self.readbuf = ""
+        return True
 
     def seek_lines(self, lines):
         bufsize = 2048
@@ -466,7 +499,22 @@ class TailFile:
         return os.stat(self.filename)[stat.ST_SIZE]
 
     def more_to_read(self):
-        end = self.end_of_file_position()
+        if self.follow_name:
+            # check for rotation *before* comparing sizes/positions below --
+            # otherwise a stale, already-exhausted file descriptor left over
+            # from before the rotation gets compared against the *new*
+            # file's size at self.filename, which can spuriously look like
+            # there's more to read and livelock readline() rereading 0 bytes
+            # from the old descriptor forever.
+            self._reopen_if_rotated()
+        try:
+            end = self.end_of_file_position()
+        except OSError:
+            if self.follow_name:
+                # rotated away, not yet recreated -- keep waiting instead
+                # of ending the tail.
+                return 0
+            raise
         if end < self.file.tell():
             self.file.seek(end)
             return 0
